@@ -15,7 +15,20 @@ CRITICAL RULES:
 3. Rate your confidence honestly. High confidence (>=0.7) means you can describe a specific attack path. Low confidence (<0.4) means you see a suspicious pattern but aren't sure it's exploitable.
 4. Focus on EXPLOITABLE vulnerabilities, not code quality issues.
 
-Respond with valid JSON matching this schema:
+CATEGORY — `category` MUST be exactly one of these nine values (no other label is accepted):
+  - auth          : authentication bypass, session fixation, CSRF
+  - data_access   : IDOR, information disclosure, sensitive data exposure
+  - input         : path traversal, SSRF, XXE, insecure deserialization, open redirect
+  - crypto        : weak algorithms/ciphers, bad randomness, side-channel/timing, padding oracles
+  - financial     : payment/price/business-logic manipulation
+  - privilege     : authorization bugs, privilege escalation, broken access control
+  - memory        : integer overflow/underflow, buffer overflow/over-read, UAF, double-free, uninitialized memory, NULL deref, format string
+  - injection     : SQL / command / code / LDAP / log / XSS injection
+  - concurrency   : race conditions, TOCTOU, data races
+
+Do NOT invent new category labels (e.g. "integer_overflow", "buffer_overflow", "weak_algorithm"). Map them to the canonical categories above (e.g. an integer overflow is `memory`; a weak cipher is `crypto`; SQLi is `injection`).
+
+RESPONSE FORMAT — output ONE JSON object (no prose, no markdown fences around the final answer) matching this schema:
 {schema}
 """
 

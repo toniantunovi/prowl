@@ -223,6 +223,26 @@ class TestParsing:
         result = client._parse_json(text)
         assert result["classification"] == "exploitable"
 
+    def test_parse_json_prefers_json_fence_over_code_snippet(self, default_config):
+        """Inline ```c / ```python code snippets in the model's reasoning must
+        not hijack JSON extraction when the real answer is in a later ```json
+        block. Regression for a crash where a trailing `{` in a C snippet was
+        extracted as the "JSON object"."""
+        client = LangChainClient(default_config)
+        text = (
+            "Looking at the function, I note:\n\n"
+            "```c\n"
+            "if(!partp || strcmp(partp, &bigpart[1 - (i == 4)])) {\n"
+            "```\n\n"
+            "My analysis:\n\n"
+            "```json\n"
+            '{"classification": "exploitable", "severity": "high"}\n'
+            "```\n"
+        )
+        result = client._parse_json(text)
+        assert result["classification"] == "exploitable"
+        assert result["severity"] == "high"
+
     def test_parse_json_prose_before_json(self, default_config):
         client = LangChainClient(default_config)
         text = 'Here is my analysis:\n\n{"classification": "false_positive", "confidence": 0.3}'
@@ -267,6 +287,24 @@ class TestParsing:
         text = 'Result: {"a": 1, "b": {"c": 2}} some trailing stuff'
         result = LangChainClient._find_json_object(text)
         assert result == '{"a": 1, "b": {"c": 2}}'
+
+    def test_find_json_object_prefers_largest_not_first(self, default_config):
+        """Inline code snippets like `QUIC_CONN_ID rscid = { 0 };` in the
+        model's prose must not hijack extraction when the real JSON
+        answer is a much larger object elsewhere. Regression for the
+        ``generate_new_token`` failure where only ``{ 0 }`` was extracted.
+        """
+        text = (
+            "## Analysis\n\n"
+            "Looking at the code, `QUIC_CONN_ID rscid = { 0 };` is initialized.\n"
+            "Then rscid.id_len = 8. Another example: `struct x = { .a = 1 };`.\n\n"
+            '{"hypotheses": [{"title": "real finding", "severity": "high"}], "analysis_notes": ""}'
+        )
+        result = LangChainClient._find_json_object(text)
+        assert '"hypotheses"' in result
+        assert "real finding" in result
+        # And the small `{ 0 }` fragment must not have been picked
+        assert result.strip() != "{ 0 }"
 
     def test_find_json_array_with_trailing_text(self, default_config):
         text = 'Here: [{"a": 1}, {"b": 2}] done'
@@ -398,6 +436,48 @@ int main() {
         assert hyp["category"] == "memory"
         assert hyp["confidence"] == 0.9
         assert hyp["attack_scenario"] == "via input"
+
+    def test_normalize_hypothesis_category_aliases(self, default_config):
+        """LLM-invented CWE-style category labels should coerce to canonical
+        SignalCategory values. Regression for OpenSSL scan failures where
+        the model returned 'integer_overflow', 'buffer_overflow',
+        'weak_algorithm', etc."""
+        client = LangChainClient(default_config)
+        data = {"hypotheses": [
+            {"title": "a", "category": "integer_overflow"},
+            {"title": "b", "category": "buffer_overflow"},
+            {"title": "c", "category": "use-after-free"},
+            {"title": "d", "category": "WEAK_ALGORITHM"},
+            {"title": "e", "category": "SQL_Injection"},
+            {"title": "f", "category": "race_condition"},
+            {"title": "g", "category": "idor"},
+            {"title": "h", "category": "memory"},  # already canonical
+        ]}
+        normalized = client._normalize_hypothesis_fields(data)
+        hyps = normalized["hypotheses"]
+        assert hyps[0]["category"] == "memory"
+        assert hyps[1]["category"] == "memory"
+        assert hyps[2]["category"] == "memory"
+        assert hyps[3]["category"] == "crypto"
+        assert hyps[4]["category"] == "injection"
+        assert hyps[5]["category"] == "concurrency"
+        assert hyps[6]["category"] == "data_access"
+        assert hyps[7]["category"] == "memory"
+
+    def test_parse_response_coerces_invalid_category(self, default_config):
+        """End-to-end: LLM returns an invalid category label, parser should
+        coerce it and succeed."""
+        from argus.models.hypothesis import HypothesisResponse
+        client = LangChainClient(default_config)
+        text = (
+            '{"hypotheses": [{"title": "t", "description": "d", '
+            '"severity": "high", "category": "integer_overflow", '
+            '"confidence": 0.8}], "analysis_notes": ""}'
+        )
+        result = client._parse_response(text, HypothesisResponse)
+        assert isinstance(result, HypothesisResponse)
+        assert len(result.hypotheses) == 1
+        assert result.hypotheses[0].category.value == "memory"
 
 
 class TestFactory:

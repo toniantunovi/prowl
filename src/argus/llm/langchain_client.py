@@ -166,13 +166,33 @@ class LangChainClient:
 
     @staticmethod
     def _extract_json_text(text: str) -> str:
-        """Extract JSON from LLM response, stripping markdown fences."""
+        """Extract JSON from LLM response, stripping markdown fences.
+
+        Prefers explicitly-tagged ```json blocks. Falls back to untagged
+        fences whose body looks like JSON. Skips fences tagged with other
+        languages (c, python, js, ...) so an inline code snippet in the
+        model's prose reasoning doesn't hijack the extraction.
+        """
         import re
         text = text.strip()
-        # Strip markdown code fences: ```json ... ``` or ``` ... ```
-        m = re.search(r"```(?:json)?\s*\n?(.*?)```", text, re.DOTALL)
-        if m:
-            text = m.group(1).strip()
+        # 1. Prefer the last explicitly-tagged ```json block (the model
+        #    sometimes shows an example schema before the final answer).
+        json_blocks = re.findall(r"```json\s*\n?(.*?)```", text, re.DOTALL)
+        if json_blocks:
+            return json_blocks[-1].strip()
+        # 2. Fall back: scan every fenced block, skip ones tagged with a
+        #    non-json language, and pick the last one whose body starts
+        #    with { or [.
+        candidate: str | None = None
+        for m in re.finditer(r"```([a-zA-Z0-9_+\-]*)\s*\n?(.*?)```", text, re.DOTALL):
+            tag = m.group(1).strip().lower()
+            body = m.group(2).strip()
+            if tag and tag != "json":
+                continue
+            if body.startswith("{") or body.startswith("["):
+                candidate = body
+        if candidate is not None:
+            return candidate
         return text
 
     @staticmethod
@@ -266,32 +286,49 @@ class LangChainClient:
 
     @staticmethod
     def _find_json_object(text: str) -> str:
-        """Find the outermost balanced { ... } in text."""
-        start = text.find('{')
-        if start < 0:
-            return text
+        """Find the best top-level balanced { ... } in text.
+
+        Returns the *largest* top-level balanced object (ties broken by
+        last-occurrence). This is more robust than picking the first ``{``
+        when the model writes prose containing inline code snippets like
+        ``QUIC_CONN_ID rscid = { 0 };`` before the actual JSON answer.
+        """
+        candidates: list[str] = []
         depth = 0
         in_str = False
-        i = start
+        start = -1
+        i = 0
         while i < len(text):
             ch = text[i]
             if in_str:
                 if ch == '\\':
-                    i += 1  # skip escaped char
-                elif ch == '"':
+                    i += 2
+                    continue
+                if ch == '"':
                     in_str = False
             else:
                 if ch == '"':
                     in_str = True
                 elif ch == '{':
+                    if depth == 0:
+                        start = i
                     depth += 1
                 elif ch == '}':
-                    depth -= 1
-                    if depth == 0:
-                        return text[start:i + 1]
+                    if depth > 0:
+                        depth -= 1
+                        if depth == 0 and start >= 0:
+                            candidates.append(text[start:i + 1])
+                            start = -1
             i += 1
-        # Unbalanced – return from start anyway, json.loads will report a clear error
-        return text[start:]
+        if not candidates:
+            # Fall back to any unbalanced fragment from the first '{' so
+            # json.loads still produces a useful error message.
+            first = text.find('{')
+            return text[first:] if first >= 0 else text
+        # Prefer the largest candidate; on ties keep the last occurrence
+        # (max() with a stable key preserves the *first* max — flip via
+        # reversed enumeration to get the last).
+        return max(candidates, key=len)
 
     @staticmethod
     def _find_json_array(text: str) -> str:
@@ -363,8 +400,89 @@ class LangChainClient:
             len(raw), raw,
         )
 
-    @staticmethod
-    def _normalize_hypothesis_fields(data: dict) -> dict:
+    # Map LLM-invented category labels onto SignalCategory values.
+    # The model often writes classic CWE-style labels (integer_overflow,
+    # buffer_overflow, weak_algorithm, ...) that aren't in our enum.
+    _CATEGORY_ALIASES = {
+        # Memory-safety family -> memory
+        "integer_overflow": "memory",
+        "integer_underflow": "memory",
+        "buffer_overflow": "memory",
+        "buffer_overread": "memory",
+        "buffer_over_read": "memory",
+        "out_of_bounds": "memory",
+        "oob_read": "memory",
+        "oob_write": "memory",
+        "use_after_free": "memory",
+        "uaf": "memory",
+        "double_free": "memory",
+        "memory_leak": "memory",
+        "uninitialized": "memory",
+        "uninitialized_memory": "memory",
+        "null_pointer": "memory",
+        "null_dereference": "memory",
+        "format_string": "memory",
+        "stack_overflow": "memory",
+        "heap_overflow": "memory",
+        "type_confusion": "memory",
+        # Crypto family -> crypto
+        "weak_algorithm": "crypto",
+        "weak_crypto": "crypto",
+        "weak_cipher": "crypto",
+        "side_channel": "crypto",
+        "timing_attack": "crypto",
+        "padding_oracle": "crypto",
+        "insecure_random": "crypto",
+        # Injection family -> injection
+        "sql_injection": "injection",
+        "sqli": "injection",
+        "xss": "injection",
+        "cross_site_scripting": "injection",
+        "command_injection": "injection",
+        "code_injection": "injection",
+        "ldap_injection": "injection",
+        "log_injection": "injection",
+        # Input-validation family -> input
+        "path_traversal": "input",
+        "directory_traversal": "input",
+        "ssrf": "input",
+        "xxe": "input",
+        "deserialization": "input",
+        "open_redirect": "input",
+        # Concurrency family -> concurrency
+        "race_condition": "concurrency",
+        "toctou": "concurrency",
+        "data_race": "concurrency",
+        # Auth family -> auth
+        "authentication": "auth",
+        "auth_bypass": "auth",
+        "session_fixation": "auth",
+        "csrf": "auth",
+        # Privilege family -> privilege
+        "authorization": "privilege",
+        "broken_access_control": "privilege",
+        "privilege_escalation": "privilege",
+        # Data-access family -> data_access
+        "idor": "data_access",
+        "info_disclosure": "data_access",
+        "information_disclosure": "data_access",
+        "sensitive_data_exposure": "data_access",
+    }
+
+    @classmethod
+    def _coerce_category(cls, value: Any) -> Any:
+        """Map LLM-invented category labels onto SignalCategory enum values."""
+        if not isinstance(value, str):
+            return value
+        normalized = value.strip().lower().replace("-", "_").replace(" ", "_")
+        # Strip a few leading qualifiers the model sometimes adds
+        for prefix in ("vuln_", "vulnerability_"):
+            if normalized.startswith(prefix):
+                normalized = normalized[len(prefix):]
+        return cls._CATEGORY_ALIASES.get(normalized, normalized)
+
+    @classmethod
+    def _normalize_hypothesis_fields(cls, data: dict) -> dict:
         """Normalize common LLM field name variations for HypothesisResponse."""
         # If the LLM returned a list directly instead of wrapping in {"hypotheses": [...]}
         if isinstance(data, list):
@@ -392,6 +510,9 @@ class LangChainClient:
                 for alias, canonical in _FIELD_ALIASES.items():
                     if alias in hyp and canonical not in hyp:
                         hyp[canonical] = hyp.pop(alias)
+                # Coerce LLM-invented category labels to canonical enum values
+                if "category" in hyp:
+                    hyp["category"] = cls._coerce_category(hyp["category"])
                 # Ensure affected_lines is a list of ints
                 if "affected_lines" in hyp and not isinstance(hyp["affected_lines"], list):
                     hyp["affected_lines"] = []
