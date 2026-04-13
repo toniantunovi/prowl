@@ -20,6 +20,54 @@ semgrep --config auto .    # SAST: known patterns, fast, deterministic
 argus scan .               # Argus: reasoning-based vulnerability research
 ```
 
+## Results on real-world codebases
+
+Argus was run against five widely deployed open-source projects. Full Markdown reports — with PoC source, ASAN output, and reproduction steps — are in [`reports/`](reports/).
+
+| Project | Commit | Findings | Validated PoCs | Report |
+|---------|--------|----------|----------------|--------|
+| ffmpeg  | `b09d57c41d` | 85 (10 HIGH) | 5 memory-corruption | [ffmpeg_b09d57c41d.md](reports/ffmpeg_b09d57c41d.md) |
+| curl    | `ec445fc595` | 74 (5 HIGH)  | 4 (MITM, heap overflow, unbounded writes) | [curl_ec445fc595.md](reports/curl_ec445fc595.md) |
+| OpenSSL | `53e349fae6` | 69 (7 HIGH)  | 2 (RSA OAEP OOB read, padding oracle) | [openssl_53e349fae6.md](reports/openssl_53e349fae6.md) |
+| SQLite  | `f02d100e08` | 59 (4 HIGH)  | 3 (SQL injection, 2× signed/unsigned OOB) | [sqlite_f02d100e08.md](reports/sqlite_f02d100e08.md) |
+| Django  | `7dc826b975` | 52 (2 HIGH)  | 2 (pickle RCE in DB cache, MD5 hasher)  | [django_7dc826b975.md](reports/django_7dc826b975.md) |
+
+Every finding below was confirmed with an executable PoC inside the Argus Docker sandbox (ASAN crash for memory bugs, shell marker for injection, brute-force for crypto).
+
+### ffmpeg — 5 validated memory-corruption PoCs
+
+- **Opus parser integer underflow → heap OOB.** `libavcodec/opus/parse.c:84` `ff_opus_parse_packet` — a crafted 5-byte Opus packet wraps `frame_bytes` negative; ASAN reports a 4,294,967,294-byte read.
+- **HLS IV stack overflow via malicious m3u8.** `libavformat/hls.c:785` `parse_playlist` — `ff_hex_to_data` writes past the 16-byte `iv[16]` stack buffer when the playlist supplies a long IV.
+- **TDSC integer overflow → heap overflow.** `libavcodec/tdsc.c:523` `tdsc_decode_frame` — `width * height * 4` overflows int32, allocates a tiny buffer, then zlib-decompresses into it. UBSAN + ASAN confirm.
+- **ATRAC9 band extension stack OOB.** `libavcodec/atrac9dec.c:545` `apply_band_extension` — `sf[6]` is indexed up to 8 when `q_unit_cnt == 13`.
+- **WMA Voice pulse array OOB write.** `libavcodec/wmavoice.c:1318` `synth_block_fcb_acb` — `pulses[80]` is indexed up to 159; the guarding `av_assert0` compiles out in release builds. ASAN reports a write 300 bytes past the buffer end.
+
+### curl — 4 validated findings
+
+- **NTLMv2 integer-wrap → heap overflow (malicious server).** `lib/curl_ntlm_core.c:540` `Curl_ntlm_core_mk_ntlmv2_resp` — an attacker-controlled `target_info_len` near `UINT_MAX` wraps the allocation size to a single byte; subsequent writes at offsets 8/16/32/44 land in adjacent heap chunks.
+- **SSH host-key verification bypass (MITM).** `lib/vssh/libssh.c:121` `myssh_is_known` — with no `CURLOPT_SSH_KNOWNHOSTS`, no MD5 fingerprint, and no callback, the function returns `SSH_OK` unconditionally on every server key.
+- **`curl_msprintf` unbounded writes.** `lib/mprintf.c:938` and `lib/mprintf.c:699` — two paths produce ASAN-confirmed overflows when attacker-influenced data reaches fixed-size buffers.
+
+### OpenSSL (4.1.0-dev master) — 2 validated findings
+
+- **RSA OAEP negative-`plen` OOB read.** `crypto/rsa/rsa_oaep.c:168` `RSA_padding_check_PKCS1_OAEP_mgf1` — an integer truncation in the caller lets `plen` go negative; the PoC produces a SEGV at `rsa_oaep.c:268` under ASAN.
+- **Bleichenbacher / Marvin-style padding oracle via `RSA_FLAG_EXT_PKEY`.** `crypto/rsa/rsa_ossl.c:519` `rsa_ossl_private_decrypt` — the HSM-key path lacks the implicit-rejection data needed for constant-time failure, leaving both an error and a timing oracle.
+
+### SQLite — 3 validated findings
+
+- **SQL injection via RBU vacuum.** `ext/rbu/sqlite3rbu.c:3694` `sqlite3rbu_step` — `rbuCreateTargetSchema` reads SQL strings from an attacker-supplied RBU database's `sqlite_schema` and passes them straight to `sqlite3_exec` on the target DB.
+- **RBU delta-apply signed/unsigned bounds bypass.** `ext/rbu/sqlite3rbu.c:590` `rbuDeltaApply` — casting unsigned `cnt` to `int` flips values ≥ 2³¹ negative, bypassing the `(int)cnt > lenDelta` guard; the subsequent `memcpy` reads/writes gigabytes out of bounds.
+- **Fossil-delta signed/unsigned promotion.** `ext/misc/fossildelta.c:539` `delta_apply` — the same bug class in the standalone fossil-delta extension.
+
+### Django — 2 validated PoCs
+
+- **Pickle RCE in `DatabaseCache.get_many`.** `django/core/cache/backends/db.py:96` — any attacker with write access to the cache table (e.g. via another SQLi, leaked creds, or a shared DB) achieves RCE through `pickle.loads`. Known-by-design but Argus flagged and exploited it end-to-end.
+- **`MD5PasswordHasher` still shipped.** `django/contrib/auth/hashers.py` — brute-force PoC against the hasher runs in the sandbox; only exploitable on deliberately misconfigured deployments, but demonstrates accurate rubric-matching on a legacy code path.
+
+### Disclosure
+
+Reports are published here for research reproducibility. The memory-corruption findings in ffmpeg, curl, and OpenSSL have also been submitted to the respective upstream security teams; follow the linked reports for status and CVE assignments as they become available.
+
 ## Requirements
 
 - Python 3.11+
@@ -66,16 +114,16 @@ Configure the provider and model in `argus.yml`:
 ```yaml
 llm:
   provider: anthropic                  # openai | anthropic | google | ollama
-  model: claude-sonnet-4-20250514
+  model: claude-opus-4-6
   temperature: 0.0
 
   # Per-layer model overrides (optional)
   hypothesis:
     model: claude-haiku-4-5-20251001   # fast/cheap for high-volume Layer 1
   triage:
-    model: claude-sonnet-4-20250514    # strong reasoning for Layer 2
+    model: claude-opus-4-6             # strong reasoning for Layer 2
   validation:
-    model: claude-sonnet-4-20250514    # code generation for Layer 3
+    model: claude-opus-4-6             # code generation for Layer 3
 ```
 
 For local models via Ollama:
@@ -191,8 +239,8 @@ Layer 3 validation uses [Claw Code](https://github.com/ultraworkers/claw-code) a
 
 ```yaml
 validation:
-  claw_timeout_default: 120    # seconds per finding
-  claw_timeout_memory: 180     # higher for memory bugs
+  claw_timeout_default: 720    # seconds per finding
+  claw_timeout_memory: 1080    # higher for memory bugs
   claw_max_turns: 30           # Claw agent turns per finding
   claw_api_key_env: null       # API key env var forwarded to container (auto-detected)
 ```
@@ -225,10 +273,12 @@ reconnaissance:
   max_review_chunks: 100             # cap targets per scan
   interaction_targets: true          # detect shared-state interaction targets
   auto_exclude: true                 # auto-exclude generated/vendored code
+  auto_exclude_override: []          # paths to force-include despite auto-exclude
 
 scoring:
   hypothesis_confidence_threshold: 0.7
   batch_confidence_threshold: 0.4
+  max_promoted_findings: 100
 
 triage:
   reachability: true
@@ -249,20 +299,22 @@ validation:
     - ubsan
     - coverage
   # Claw Code PoC validation settings
-  claw_timeout_default: 120          # wall-clock seconds per finding
-  claw_timeout_memory: 180           # higher budget for memory bugs
+  claw_timeout_default: 720          # wall-clock seconds per finding
+  claw_timeout_memory: 1080          # higher budget for memory bugs
   claw_max_turns: 30                 # Claw agent tool-use turns
   claw_api_key_env: null             # API key env var forwarded to container (auto-detected)
 
 sandbox:
   runtime: docker
-  timeout_default: 30                # seconds
-  timeout_race_condition: 120
-  timeout_max: 300
+  timeout_default: 180               # seconds
+  timeout_race_condition: 720
+  timeout_max: 1800
+  timeout_startup: 180                # container startup budget
   mem_limit: "512m"
   cpu_quota: 200000                  # 2 CPU cores
   pids_limit: 256
   network: none                      # no network egress
+  tier3_services: [postgres, mysql, redis]
 
 concurrency:
   max_concurrent_hypotheses: 8
@@ -280,7 +332,7 @@ cache:
   cross_cutting_invalidation: true
 
 output:
-  format: "markdown"                  # text, json, sarif, ai, markdown
+  format: "text"                      # text, json, sarif, ai, markdown
   include_poc: true
   include_reasoning: false
 
@@ -290,16 +342,25 @@ resume:
 
 llm:
   provider: "anthropic"              # openai | anthropic | google | ollama
-  model: "claude-sonnet-4-20250514"
+  model: "claude-opus-4-6"
   api_key_env: null                  # auto-detected per provider
   base_url: null                     # for ollama/vLLM
   temperature: 0.0
   hypothesis:                        # per-layer overrides (all optional)
+    provider: null
     model: null
+    temperature: null
+    max_tokens: null
   triage:
+    provider: null
     model: null
+    temperature: null
+    max_tokens: null
   validation:
+    provider: null
     model: null
+    temperature: null
+    max_tokens: null
 ```
 
 ### Custom rubrics
@@ -402,8 +463,8 @@ Language is auto-detected from file extensions. Override with `scan.languages` i
 ### Running tests
 
 ```bash
-# All tests (327 tests, ~1 second)
-pytest tests/ -v
+# All tests (348 tests, ~1 second)
+pytest tests/ -v --ignore=tests/fixtures
 
 # Specific module
 pytest tests/test_recon/ -v
@@ -453,6 +514,8 @@ tests/
     test_output/
     test_pipeline/   # Integration with mocked LLM + sandbox
     test_llm/        # LangChain client, provider routing, config
+    test_sandbox/    # Docker sandbox manager, image build, instrumentation
+    test_validation/ # Claw backend, result checking, patch generation
     test_integration/
 ```
 
@@ -474,4 +537,4 @@ SAST is deterministic, fast, and free. Argus uses LLM reasoning, costs tokens, a
 
 ## Spec
 
-The full specification is in [`argus.md`](argus.md). The implementation plan is in [`plan.md`](plan.md).
+The full specification is in [`argus.md`](argus.md).

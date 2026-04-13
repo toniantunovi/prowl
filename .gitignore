@@ -44,3 +44,6 @@ argus.md
 sandbox-images/*
 !sandbox-images/*.Dockerfile
 !sandbox-images/README.md
+
+# Large external source trees used as scan fixtures (cloned locally, not committed)
+tests/fixtures/github/
