@@ -1,28 +1,18 @@
 # Argus
 
-Autonomous vulnerability discovery and exploit validation. Argus decomposes security research into structured stages that LLMs execute reliably: reconnaissance, hypothesis generation, triage, and proof-of-concept validation.
-
-Argus doesn't review code for style or suggest improvements. It hunts for exploitable vulnerabilities and proves they're real.
-
-| Domain | Capability | Example |
-|--------|-----------|---------|
-| Web application vulnerabilities | Full exploit PoC | Missing auth &rarr; HTTP request proving unauthorized access |
-| Injection flaws | Full exploit PoC | SQL injection &rarr; crafted input extracting data |
-| Business logic bugs | Full exploit PoC | API call sequence exercising invalid state transition |
-| Memory safety (C/C++/Rust unsafe) | Crash confirmation via ASAN | Buffer overflow &rarr; crafted input triggering ASAN report |
-| Concurrency bugs | Race demonstration | TOCTOU &rarr; concurrent requests proving the race window |
-| Multi-finding chains | Chain identification + PoCs | SSRF + no internal auth &rarr; full internal network access |
-
-Argus is not a replacement for SAST. Run both:
+> **Autonomous vulnerability discovery and exploit validation.** Argus reads a codebase, generates hypotheses, and writes working proof-of-concept exploits inside a Docker sandbox — compiled against the real source, confirmed by ASAN crashes, injection markers, or brute-force success.
 
 ```bash
-semgrep --config auto .    # SAST: known patterns, fast, deterministic
-argus scan .               # Argus: reasoning-based vulnerability research
+pip install "argus-sec[anthropic]"
+export ANTHROPIC_API_KEY=...
+argus scan /path/to/project
 ```
 
-## Results on real-world codebases
+Reconnaissance is fully deterministic (tree-sitter, no LLM — same codebase always produces the same target list). The LLM layers are rubric-constrained, confidence-gated, and cached. PoC generation runs as an agent loop via [Claw Code](https://github.com/ultraworkers/claw-code) inside a hardened Docker sandbox.
 
-Argus was run against five widely deployed open-source projects. Full Markdown reports — with PoC source, ASAN output, and reproduction steps — are in [`reports/`](reports/).
+## What it found
+
+Running Argus against five widely deployed open-source projects produced **16 validated exploit PoCs**. Full reports with PoC source, ASAN output, and reproduction steps: [`reports/`](reports/).
 
 | Project | Commit | Findings | Validated PoCs | Report |
 |---------|--------|----------|----------------|--------|
@@ -32,7 +22,28 @@ Argus was run against five widely deployed open-source projects. Full Markdown r
 | SQLite  | `f02d100e08` | 59 (4 HIGH)  | 3 (SQL injection, 2× signed/unsigned OOB) | [sqlite_f02d100e08.md](reports/sqlite_f02d100e08.md) |
 | Django  | `7dc826b975` | 52 (2 HIGH)  | 2 (pickle RCE in DB cache, MD5 hasher)  | [django_7dc826b975.md](reports/django_7dc826b975.md) |
 
-Every finding below was confirmed with an executable PoC inside the Argus Docker sandbox (ASAN crash for memory bugs, shell marker for injection, brute-force for crypto).
+## Argus vs. SAST
+
+| Argus | SAST (semgrep, CodeQL) |
+|-------|------------------------|
+| Reasons about *intent*, then proves exploitability | Matches syntactic patterns |
+| Full PoCs — HTTP request, ASAN crash, race demo, brute-force | Source line flags |
+| LLM reasoning; costs tokens, takes minutes | Deterministic, fast, free |
+| Research workbench | Good for CI |
+
+Run both. `semgrep --config auto .` catches known patterns at merge time; `argus scan .` finds the three-step API call sequence that lets an unauthenticated user approve their own refund, then generates the HTTP request sequence that demonstrates it.
+
+| Domain | What Argus produces |
+|--------|---------------------|
+| Web app vulns | HTTP request sequence proving unauthorized access / invalid state transition |
+| Injection | Crafted input extracting data through the exact sink |
+| Memory safety (C/C++/Rust unsafe) | Crafted input triggering an ASAN report |
+| Concurrency | TOCTOU — concurrent requests proving the race window |
+| Multi-finding chains | Chain identification + end-to-end PoC (SSRF + no internal auth → internal network access) |
+
+## Headline findings
+
+Every finding below was confirmed with an executable PoC inside the Argus Docker sandbox — ASAN crash for memory bugs, shell marker for injection, brute-force for crypto. No version is specifically claimed as unpatched; see each report for the exact commit scanned.
 
 ### ffmpeg — 5 validated memory-corruption PoCs
 
@@ -67,6 +78,40 @@ Every finding below was confirmed with an executable PoC inside the Argus Docker
 ### Disclosure
 
 Reports are published here for research reproducibility. The memory-corruption findings in ffmpeg, curl, and OpenSSL have also been submitted to the respective upstream security teams; follow the linked reports for status and CVE assignments as they become available.
+
+## How it works
+
+```
+Target codebase
+    │
+    ▼
+RECONNAISSANCE (deterministic, no LLM)
+    Tree-sitter parsing → function extraction → risk signal detection
+    → vulnerability scoring → call graph → taint tracking → target ranking
+    │
+    ▼  (ranked target list)
+LAYER 1: HYPOTHESIS (LLM)
+    Context builder scopes each target function (~4K tokens)
+    LLM hypothesizes vulnerabilities against detection rubrics
+    Confidence gating: promote (≥0.7) / batch (0.4–0.7) / suppress (<0.4)
+    │
+    ▼  (confidence-gated hypotheses)
+LAYER 2: TRIAGE + CHAIN ANALYSIS (LLM)
+    Individual + batch triage: exploitable / mitigated / false_positive / uncertain
+    Deterministic chain grouping + LLM chain evaluation
+    Severity gating for Layer 3
+    │
+    ▼  (exploitable + uncertain findings)
+LAYER 3: EXPLOIT VALIDATION (Claw Code + Docker sandbox)
+    Claw Code agent autonomously writes/compiles/runs PoCs inside sandbox
+    Per-vuln-class validation (HTTP requests, ASAN crashes, race conditions, …)
+    Optional patch generation with compile + PoC + test validation
+    │
+    ▼
+VULNERABILITY REPORT (text / JSON / SARIF / AI / Markdown)
+```
+
+**Structured output enforcement** at every LLM hop: Pydantic schemas in the prompt, `model_validate_json` on the response, one retry with error context, skip the target on second failure. **Dependency injection** for the LLM client and sandbox manager, so the whole pipeline runs under `MockLLMClient` + `MockSandboxManager` in tests (348 tests, ~1 s). **Async with bounded parallelism** via `anyio.CapacityLimiter` — 8 concurrent hypotheses, 4 triage, 2 validations.
 
 ## Requirements
 
@@ -145,40 +190,6 @@ llm:
   model: llama3
   base_url: http://localhost:11434
 ```
-
-## How it works
-
-```
-Target codebase
-    |
-    v
-RECONNAISSANCE (deterministic, no LLM)
-    Tree-sitter parsing -> function extraction -> risk signal detection
-    -> vulnerability scoring -> call graph -> taint tracking -> target ranking
-    |
-    v  (ranked target list)
-LAYER 1: HYPOTHESIS (LLM)
-    Context builder scopes each target function (~4K tokens)
-    LLM hypothesizes vulnerabilities against detection rubrics
-    Confidence gating: promote (>=0.7) / batch (0.4-0.7) / suppress (<0.4)
-    |
-    v  (confidence-gated hypotheses)
-LAYER 2: TRIAGE + CHAIN ANALYSIS (LLM)
-    Individual + batch triage: exploitable / mitigated / false_positive / uncertain
-    Deterministic chain grouping + LLM chain evaluation
-    Severity gating for Layer 3
-    |
-    v  (exploitable + uncertain findings)
-LAYER 3: EXPLOIT VALIDATION (Claw Code + Docker sandbox)
-    Claw Code agent autonomously writes/compiles/runs PoCs inside sandbox
-    Per-vuln-class validation (HTTP requests, ASAN crashes, race conditions, etc.)
-    Optional patch generation with compile + PoC + test validation
-    |
-    v
-VULNERABILITY REPORT (text / JSON / SARIF / AI / Markdown format)
-```
-
-**Key property:** Reconnaissance is fully deterministic (tree-sitter, no LLM). Same codebase always produces the same target list. LLM layers are rubric-constrained and cached.
 
 ## Usage
 
@@ -260,7 +271,10 @@ The Claw container needs network access for LLM API calls. See the [spec](argus.
 
 ## Configuration
 
-Create `argus.yml` in your project root. All fields are optional -- defaults are shown below:
+Create `argus.yml` in your project root. All fields are optional.
+
+<details>
+<summary><b>Full defaults (click to expand)</b></summary>
 
 ```yaml
 scan:
@@ -373,6 +387,8 @@ llm:
     temperature: null
     max_tokens: null
 ```
+
+</details>
 
 ### Custom rubrics
 
@@ -529,14 +545,6 @@ tests/
     test_validation/ # Claw backend, result checking, patch generation
     test_integration/
 ```
-
-## How Argus differs from SAST
-
-SAST matches patterns. Argus reasons about what code is *supposed* to do, then proves it doesn't.
-
-SAST finds `eval(user_input)`. Argus finds that a three-step API call sequence lets an unauthenticated user approve their own refund, then generates an HTTP request sequence that demonstrates it.
-
-SAST is deterministic, fast, and free. Argus uses LLM reasoning, costs tokens, and takes minutes. They catch different classes of bugs. Run both.
 
 ## Limitations
 
