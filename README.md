@@ -1,6 +1,6 @@
 # Prowl
 
-> **Autonomous vulnerability discovery and exploit validation.** Prowl reads a codebase, generates hypotheses, and writes working proof-of-concept exploits inside a Docker sandbox — compiled against the real source, confirmed by ASAN crashes, injection markers, or brute-force success.
+> **Autonomous vulnerability discovery and exploit validation.** Prowl reads a codebase, generates hypotheses, then builds and runs the actual target project in a Docker sandbox to prove vulnerabilities are real — compiling C/C++ binaries with ASAN, starting Python/Node servers and sending crafted requests, or exercising Go/Rust/Java binaries with crafted inputs.
 
 ```bash
 pip install "prowl-sec[anthropic]"
@@ -12,24 +12,12 @@ Prefer a `.env` file? Drop `ANTHROPIC_API_KEY=sk-ant-...` into `.env` in the dir
 
 Reconnaissance is fully deterministic (tree-sitter, no LLM — same codebase always produces the same target list). The LLM layers are rubric-constrained, confidence-gated, and cached. PoC generation runs as an agent loop via [Claw Code](https://github.com/ultraworkers/claw-code) inside a hardened Docker sandbox.
 
-## What it found
-
-Running Prowl against five widely deployed open-source projects produced **16 validated exploit PoCs**. Full reports with PoC source, ASAN output, and reproduction steps: [`reports/`](reports/).
-
-| Project | Commit | Findings | Validated PoCs | Report |
-|---------|--------|----------|----------------|--------|
-| ffmpeg  | `b09d57c41d` | 85 (10 HIGH) | 5 memory-corruption | [ffmpeg_b09d57c41d.md](reports/ffmpeg_b09d57c41d.md) |
-| curl    | `ec445fc595` | 74 (5 HIGH)  | 4 (MITM, heap overflow, unbounded writes) | [curl_ec445fc595.md](reports/curl_ec445fc595.md) |
-| OpenSSL | `53e349fae6` | 69 (7 HIGH)  | 2 (RSA OAEP OOB read, padding oracle) | [openssl_53e349fae6.md](reports/openssl_53e349fae6.md) |
-| SQLite  | `f02d100e08` | 59 (4 HIGH)  | 3 (SQL injection, 2× signed/unsigned OOB) | [sqlite_f02d100e08.md](reports/sqlite_f02d100e08.md) |
-| Django  | `7dc826b975` | 52 (2 HIGH)  | 2 (pickle RCE in DB cache, MD5 hasher)  | [django_7dc826b975.md](reports/django_7dc826b975.md) |
-
 ## Prowl vs. SAST
 
 | Prowl | SAST (semgrep, CodeQL) |
 |-------|------------------------|
 | Reasons about *intent*, then proves exploitability | Matches syntactic patterns |
-| Full PoCs — HTTP request, ASAN crash, race demo, brute-force | Source line flags |
+| Builds the actual project, runs the real binary/server with crafted inputs — ASAN crashes on the real binary, HTTP requests to the running server | Source line flags |
 | LLM reasoning; costs tokens, takes minutes | Deterministic, fast, free |
 | Research workbench | Good for CI |
 
@@ -37,49 +25,11 @@ Run both. `semgrep --config auto .` catches known patterns at merge time; `prowl
 
 | Domain | What Prowl produces |
 |--------|---------------------|
-| Web app vulns | HTTP request sequence proving unauthorized access / invalid state transition |
-| Injection | Crafted input extracting data through the exact sink |
-| Memory safety (C/C++/Rust unsafe) | Crafted input triggering an ASAN report |
-| Concurrency | TOCTOU — concurrent requests proving the race window |
-| Multi-finding chains | Chain identification + end-to-end PoC (SSRF + no internal auth → internal network access) |
-
-## Headline findings
-
-Every finding below was confirmed with an executable PoC inside the Prowl Docker sandbox — ASAN crash for memory bugs, shell marker for injection, brute-force for crypto. No version is specifically claimed as unpatched; see each report for the exact commit scanned.
-
-### ffmpeg — 5 validated memory-corruption PoCs
-
-- **Opus parser integer underflow → heap OOB.** `libavcodec/opus/parse.c:84` `ff_opus_parse_packet` — a crafted 5-byte Opus packet wraps `frame_bytes` negative; ASAN reports a 4,294,967,294-byte read.
-- **HLS IV stack overflow via malicious m3u8.** `libavformat/hls.c:785` `parse_playlist` — `ff_hex_to_data` writes past the 16-byte `iv[16]` stack buffer when the playlist supplies a long IV.
-- **TDSC integer overflow → heap overflow.** `libavcodec/tdsc.c:523` `tdsc_decode_frame` — `width * height * 4` overflows int32, allocates a tiny buffer, then zlib-decompresses into it. UBSAN + ASAN confirm.
-- **ATRAC9 band extension stack OOB.** `libavcodec/atrac9dec.c:545` `apply_band_extension` — `sf[6]` is indexed up to 8 when `q_unit_cnt == 13`.
-- **WMA Voice pulse array OOB write.** `libavcodec/wmavoice.c:1318` `synth_block_fcb_acb` — `pulses[80]` is indexed up to 159; the guarding `av_assert0` compiles out in release builds. ASAN reports a write 300 bytes past the buffer end.
-
-### curl — 4 validated findings
-
-- **NTLMv2 integer-wrap → heap overflow (malicious server).** `lib/curl_ntlm_core.c:540` `Curl_ntlm_core_mk_ntlmv2_resp` — an attacker-controlled `target_info_len` near `UINT_MAX` wraps the allocation size to a single byte; subsequent writes at offsets 8/16/32/44 land in adjacent heap chunks.
-- **SSH host-key verification bypass (MITM).** `lib/vssh/libssh.c:121` `myssh_is_known` — with no `CURLOPT_SSH_KNOWNHOSTS`, no MD5 fingerprint, and no callback, the function returns `SSH_OK` unconditionally on every server key.
-- **`curl_msprintf` unbounded writes.** `lib/mprintf.c:938` and `lib/mprintf.c:699` — two paths produce ASAN-confirmed overflows when attacker-influenced data reaches fixed-size buffers.
-
-### OpenSSL (4.1.0-dev master) — 2 validated findings
-
-- **RSA OAEP negative-`plen` OOB read.** `crypto/rsa/rsa_oaep.c:168` `RSA_padding_check_PKCS1_OAEP_mgf1` — an integer truncation in the caller lets `plen` go negative; the PoC produces a SEGV at `rsa_oaep.c:268` under ASAN.
-- **Bleichenbacher / Marvin-style padding oracle via `RSA_FLAG_EXT_PKEY`.** `crypto/rsa/rsa_ossl.c:519` `rsa_ossl_private_decrypt` — the HSM-key path lacks the implicit-rejection data needed for constant-time failure, leaving both an error and a timing oracle.
-
-### SQLite — 3 validated findings
-
-- **SQL injection via RBU vacuum.** `ext/rbu/sqlite3rbu.c:3694` `sqlite3rbu_step` — `rbuCreateTargetSchema` reads SQL strings from an attacker-supplied RBU database's `sqlite_schema` and passes them straight to `sqlite3_exec` on the target DB.
-- **RBU delta-apply signed/unsigned bounds bypass.** `ext/rbu/sqlite3rbu.c:590` `rbuDeltaApply` — casting unsigned `cnt` to `int` flips values ≥ 2³¹ negative, bypassing the `(int)cnt > lenDelta` guard; the subsequent `memcpy` reads/writes gigabytes out of bounds.
-- **Fossil-delta signed/unsigned promotion.** `ext/misc/fossildelta.c:539` `delta_apply` — the same bug class in the standalone fossil-delta extension.
-
-### Django — 2 validated PoCs
-
-- **Pickle RCE in `DatabaseCache.get_many`.** `django/core/cache/backends/db.py:96` — any attacker with write access to the cache table (e.g. via another SQLi, leaked creds, or a shared DB) achieves RCE through `pickle.loads`. Known-by-design but Prowl flagged and exploited it end-to-end.
-- **`MD5PasswordHasher` still shipped.** `django/contrib/auth/hashers.py` — brute-force PoC against the hasher runs in the sandbox; only exploitable on deliberately misconfigured deployments, but demonstrates accurate rubric-matching on a legacy code path.
-
-### Disclosure
-
-Reports are published here for research reproducibility. The memory-corruption findings in ffmpeg, curl, and OpenSSL have also been submitted to the respective upstream security teams; follow the linked reports for status and CVE assignments as they become available.
+| Web app vulns | Installs deps, starts the actual server, sends HTTP requests proving unauthorized access / invalid state transition |
+| Injection | Starts the real application, sends crafted input extracting data through the exact sink |
+| Memory safety (C/C++/Rust unsafe) | Compiles the actual project with ASAN, runs the real binary with crafted input triggering an ASAN report |
+| Concurrency | Builds and runs the real binary/server, sends concurrent requests proving the race window |
+| Multi-finding chains | Chain identification + end-to-end validation against the running application (SSRF + no internal auth → internal network access) |
 
 ## How it works
 
@@ -105,15 +55,18 @@ LAYER 2: TRIAGE + CHAIN ANALYSIS (LLM)
     │
     ▼  (exploitable + uncertain findings)
 LAYER 3: EXPLOIT VALIDATION (Claw Code + Docker sandbox)
-    Claw Code agent autonomously writes/compiles/runs PoCs inside sandbox
-    Per-vuln-class validation (HTTP requests, ASAN crashes, race conditions, …)
-    Optional patch generation with compile + PoC + test validation
+    Claw Code agent builds the actual project inside Docker
+    C/C++: compiles with ASAN/UBSAN, runs the real binary with crafted inputs
+    Python/Node: installs deps, starts the actual server, sends crafted HTTP requests
+    Go/Rust/Java: builds with native toolchain, runs with crafted inputs
+    Per-vuln-class validation (ASAN crashes, injection markers, auth bypass, ...)
+    Optional patch generation with compile + test validation
     │
     ▼
 VULNERABILITY REPORT (text / JSON / SARIF / AI / Markdown)
 ```
 
-**Structured output enforcement** at every LLM hop: Pydantic schemas in the prompt, `model_validate_json` on the response, one retry with error context, skip the target on second failure. **Dependency injection** for the LLM client and sandbox manager, so the whole pipeline runs under `MockLLMClient` + `MockSandboxManager` in tests (348 tests, ~1 s). **Async with bounded parallelism** via `anyio.CapacityLimiter` — 8 concurrent hypotheses, 4 triage, 2 validations.
+**Structured output enforcement** at every LLM hop: Pydantic schemas in the prompt, `model_validate_json` on the response, one retry with error context, skip the target on second failure. **Dependency injection** for the LLM client and sandbox manager, so the whole pipeline runs under `MockLLMClient` + `MockSandboxManager` in tests (385 tests, ~1 s). **Async with bounded parallelism** via `anyio.CapacityLimiter` — 8 concurrent hypotheses, 4 triage, 2 validations.
 
 ## Requirements
 
@@ -259,14 +212,25 @@ prowl clean-state
 
 ## PoC validation via Claw Code
 
-Layer 3 validation uses [Claw Code](https://github.com/ultraworkers/claw-code) as an autonomous agent inside the Docker sandbox. Instead of generating PoC code in a single LLM call, Claw autonomously writes, compiles, debugs, and runs PoCs using its own tool loop (bash, file read/write). It compiles against the actual target source and iterates on build errors without round-tripping through Prowl.
+Layer 3 validation uses [Claw Code](https://github.com/ultraworkers/claw-code) as an autonomous agent inside the Docker sandbox. Instead of generating standalone PoC code, Claw builds and runs the actual target project, then exercises it with crafted inputs to confirm the vulnerability is real.
+
+**How it works per language:**
+
+- **C/C++:** Auto-detects the build system (cmake, autotools, meson, make), injects `ASAN_OPTIONS` and `UBSAN_OPTIONS` flags, compiles the real project, runs the binary with crafted inputs, and checks that ASAN traces include the target function.
+- **Python/Node:** Installs dependencies (`pip install` / `npm install`), starts the actual application server, and sends crafted HTTP requests to the vulnerable endpoint.
+- **Go/Rust/Java:** Builds with the native toolchain (`go build -race`, `cargo build`, `mvn package`), then runs the binary with crafted inputs.
+
+Each language gets an enriched Docker image with full build toolchains. Containers run with elevated resources: 2 GB RAM, 1 GB tmpfs, 1024 PIDs, 30-minute timeout, and up to 50 Claw agent turns. On success, Claw writes the `ARGUS_VALIDATED` marker and saves a `test.sh` script for reproducibility.
 
 ```yaml
 validation:
-  claw_timeout_default: 720    # seconds per finding
-  claw_timeout_memory: 1080    # higher for memory bugs
-  claw_max_turns: 30           # Claw agent turns per finding
-  claw_api_key_env: null       # API key env var forwarded to container (auto-detected)
+  claw_timeout_build: 1800       # 30 minutes for full-project builds
+  claw_max_turns_build: 50       # Claw agent turns for build+test
+  claw_api_key_env: null         # auto-detected from LLM config
+
+sandbox:
+  mem_limit_build: "2g"          # 2 GB for compilation
+  cpu_quota_build: 400000        # double CPU for build phase
 ```
 
 The Claw container needs network access for LLM API calls. See the [spec](prowl.md) for the full security model.
@@ -326,9 +290,8 @@ validation:
     - ubsan
     - coverage
   # Claw Code PoC validation settings
-  claw_timeout_default: 720          # wall-clock seconds per finding
-  claw_timeout_memory: 1080          # higher budget for memory bugs
-  claw_max_turns: 30                 # Claw agent tool-use turns
+  claw_timeout_build: 1800           # 30 minutes for full-project builds
+  claw_max_turns_build: 50           # Claw agent turns for build+test
   claw_api_key_env: null             # API key env var forwarded to container (auto-detected)
 
 sandbox:
@@ -338,7 +301,9 @@ sandbox:
   timeout_max: 1800
   timeout_startup: 180                # container startup budget
   mem_limit: "512m"
+  mem_limit_build: "2g"              # 2 GB for compilation
   cpu_quota: 200000                  # 2 CPU cores
+  cpu_quota_build: 400000            # double CPU for build phase
   pids_limit: 256
   network: none                      # no network egress
   tier3_services: [postgres, mysql, redis]
@@ -492,7 +457,7 @@ Language is auto-detected from file extensions. Override with `scan.languages` i
 ### Running tests
 
 ```bash
-# All tests (348 tests, ~1 second)
+# All tests (385 tests, ~1 second)
 pytest tests/ -v --ignore=tests/fixtures
 
 # Specific module
